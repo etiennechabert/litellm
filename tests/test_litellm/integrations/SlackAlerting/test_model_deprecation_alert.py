@@ -17,6 +17,7 @@ from litellm.proxy._types import AlertType
 from litellm.types.proxy.model_deprecation import (
     DEFAULT_DEPRECATION_CHECK_INTERVAL_SECONDS,
     DEPRECATION_IDLE_POLL_SECONDS,
+    DEPRECATION_LOCK_RETRY_SECONDS,
 )
 
 
@@ -253,3 +254,88 @@ async def test_should_alert_only_from_the_pod_holding_the_daily_lock(
         "ttl": DEFAULT_DEPRECATION_CHECK_INTERVAL_SECONDS,
         "allow_reentrant": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_should_retry_soon_when_lock_claim_fails(monkeypatch):
+    """A transient Redis error surfaces as acquire_lock=False, and must not silence the fleet 24h"""
+    monkeypatch.setattr(
+        litellm,
+        "model_cost",
+        {"dead-model": {"deprecation_date": "2020-01-01", "litellm_provider": "openai"}},
+    )
+    alerting = SlackAlerting(
+        alerting=["slack"], alert_types=[AlertType.model_deprecation_warnings]
+    )
+    router = _make_router(
+        [
+            {
+                "model_name": "dead-alias",
+                "litellm_params": {"model": "dead-model"},
+                "model_info": {"id": "1"},
+            }
+        ]
+    )
+    pod_lock_manager = MagicMock()
+    pod_lock_manager.acquire_lock = AsyncMock(return_value=False)
+    slept: list[float] = []
+
+    async def stop_after_first_sleep(seconds):
+        slept.append(seconds)
+        raise asyncio.CancelledError
+
+    with (
+        patch.object(alerting, "send_alert", new_callable=AsyncMock) as mock_send_alert,
+        patch(
+            "litellm.integrations.SlackAlerting.slack_alerting.asyncio.sleep",
+            side_effect=stop_after_first_sleep,
+        ),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await alerting.run_scheduled_deprecation_check(
+            get_llm_router=lambda: router, pod_lock_manager=pod_lock_manager
+        )
+
+    assert slept == [DEPRECATION_LOCK_RETRY_SECONDS]
+    mock_send_alert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_should_not_claim_lock_when_no_deprecations(monkeypatch):
+    """An empty pass must not burn the 24h fleet lock, so mid-day sunsets can still alert"""
+    monkeypatch.setattr(litellm, "model_cost", {})
+    alerting = SlackAlerting(
+        alerting=["slack"], alert_types=[AlertType.model_deprecation_warnings]
+    )
+    router = _make_router(
+        [
+            {
+                "model_name": "fresh",
+                "litellm_params": {"model": "openai/gpt-4o"},
+                "model_info": {"id": "x"},
+            }
+        ]
+    )
+    pod_lock_manager = MagicMock()
+    pod_lock_manager.acquire_lock = AsyncMock(return_value=True)
+    slept: list[float] = []
+
+    async def stop_after_first_sleep(seconds):
+        slept.append(seconds)
+        raise asyncio.CancelledError
+
+    with (
+        patch.object(alerting, "send_alert", new_callable=AsyncMock) as mock_send_alert,
+        patch(
+            "litellm.integrations.SlackAlerting.slack_alerting.asyncio.sleep",
+            side_effect=stop_after_first_sleep,
+        ),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await alerting.run_scheduled_deprecation_check(
+            get_llm_router=lambda: router, pod_lock_manager=pod_lock_manager
+        )
+
+    assert slept == [DEPRECATION_LOCK_RETRY_SECONDS]
+    pod_lock_manager.acquire_lock.assert_not_awaited()
+    mock_send_alert.assert_not_awaited()

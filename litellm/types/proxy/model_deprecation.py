@@ -11,6 +11,8 @@ DEFAULT_DEPRECATION_CHECK_INTERVAL_SECONDS: Final = 24 * 60 * 60
 
 DEPRECATION_IDLE_POLL_SECONDS: Final = 30
 
+DEPRECATION_LOCK_RETRY_SECONDS: Final = 5 * 60
+
 DeprecationStatus = Literal["upcoming", "imminent", "deprecated"]
 
 

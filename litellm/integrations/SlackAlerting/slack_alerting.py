@@ -53,6 +53,7 @@ from litellm.types.integrations.slack_alerting import *
 from litellm.types.proxy.model_deprecation import (
     DEFAULT_DEPRECATION_CHECK_INTERVAL_SECONDS,
     DEPRECATION_IDLE_POLL_SECONDS,
+    DEPRECATION_LOCK_RETRY_SECONDS,
 )
 
 from ..email_templates.templates import *
@@ -1062,8 +1063,16 @@ Model Info:
     def _deprecation_alerts_enabled(self) -> bool:
         return self.alerting is not None and AlertType.model_deprecation_warnings in self.alert_types
 
-    async def send_model_deprecation_alert(self, llm_router: Router | None = None) -> bool:
-        """Alert on the router's deprecated and imminent models, True when one was sent"""
+    async def send_model_deprecation_alert(
+        self,
+        llm_router: Router | None = None,
+        pod_lock_manager: "PodLockManager | None" = None,
+    ) -> bool:
+        """Alert on the router's deprecated and imminent models, True when one was sent
+
+        The daily fleet lock is claimed only after we confirm there is content to alert on,
+        so an empty pass does not burn the 24h window for every other replica.
+        """
         if not self._deprecation_alerts_enabled():
             return False
 
@@ -1075,6 +1084,9 @@ Model Info:
         snapshot: Final = collect_model_deprecations(llm_router=llm_router)
         message: Final = format_deprecation_alert_message(snapshot)
         if message is None:
+            return False
+
+        if not await self._claimed_deprecation_alert_window(pod_lock_manager):
             return False
 
         level: Final[Literal["Low", "Medium", "High"]] = "High" if snapshot.deprecated else "Medium"
@@ -1103,22 +1115,40 @@ Model Info:
             )
         ) is not False
 
+    async def _send_deprecation_alert_swallowing_errors(
+        self,
+        llm_router: Router,
+        pod_lock_manager: "PodLockManager | None",
+    ) -> bool:
+        """A failed pass must not kill the daily loop, so exceptions here fall through as 'not sent'"""
+        try:
+            return await self.send_model_deprecation_alert(
+                llm_router=llm_router, pod_lock_manager=pod_lock_manager
+            )
+        except Exception as e:  # noqa: BLE001  # a failed alert must not kill the daily loop
+            verbose_proxy_logger.exception("Error in model deprecation alert loop: %s", e)
+            return False
+
     async def run_scheduled_deprecation_check(
         self,
         get_llm_router: Callable[[], Router | None] = _proxy_llm_router,
         pod_lock_manager: "PodLockManager | None" = None,
     ) -> None:
-        """Alert once the router is loaded and the alert is on, then daily, re-reading both each pass"""
+        """Alert once the router is loaded and the alert is on, then daily, re-reading both each pass
+
+        A failed lock claim (transient Redis error or another pod holds the day) and an empty check
+        retry on a short cadence, so a boot-time Redis blip does not silence the fleet for 24h.
+        """
         while True:
             if (llm_router := get_llm_router()) is None or not self._deprecation_alerts_enabled():
                 await asyncio.sleep(DEPRECATION_IDLE_POLL_SECONDS)
                 continue
-            try:
-                if await self._claimed_deprecation_alert_window(pod_lock_manager):
-                    await self.send_model_deprecation_alert(llm_router=llm_router)
-            except Exception as e:  # noqa: BLE001  # a failed alert must not kill the daily loop
-                verbose_proxy_logger.exception("Error in model deprecation alert loop: %s", e)
-            await asyncio.sleep(DEFAULT_DEPRECATION_CHECK_INTERVAL_SECONDS)
+            alert_sent: Final = await self._send_deprecation_alert_swallowing_errors(
+                llm_router=llm_router, pod_lock_manager=pod_lock_manager
+            )
+            await asyncio.sleep(
+                DEFAULT_DEPRECATION_CHECK_INTERVAL_SECONDS if alert_sent else DEPRECATION_LOCK_RETRY_SECONDS
+            )
 
     async def send_webhook_alert(self, webhook_event: WebhookEvent) -> bool:
         """
